@@ -1,15 +1,18 @@
 """
 market_data.py — Tool 1: query_live_market_data
 
-Fetches the latest price/volume snapshot for a US equity ticker from
-Polygon.io's REST API (free tier, 5 req/min).
+Fetches market data for a US equity ticker using a dual-provider strategy:
 
-Endpoint used:
-  GET https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}
-  Docs: https://polygon.io/docs/stocks/get_v2_snapshot_locale_us_markets_stocks_tickers__stocksTicker_
+1) Finnhub (primary)
+2) Polygon.io previous-day aggregate (fallback)
+
+Endpoints used:
+    Finnhub: GET https://finnhub.io/api/v1/stock/candle
+    Polygon: GET https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?adjusted=true
 """
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -19,6 +22,195 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _POLYGON_BASE = "https://api.polygon.io"
+_FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+
+def _build_snapshot_response(
+    ticker: str,
+    price: float,
+    open_price: float,
+    high: float,
+    low: float,
+    volume: int,
+    *,
+    source: str,
+    data_freshness: str,
+    change_reference: str,
+) -> dict[str, Any]:
+    change = price - open_price
+    change_pct = (change / open_price * 100) if open_price else 0.0
+    change_pct_str = f"{change_pct:+.2f}%"
+
+    summary = (
+        f"{ticker} {source} data ({data_freshness}): price ${price:,.2f}, "
+        f"{change_pct_str} vs {change_reference}, "
+        f"volume {volume / 1_000_000:.1f}M shares."
+    )
+
+    return {
+        "ticker": ticker,
+        "price": round(price, 2),
+        "open": round(open_price, 2),
+        "high": round(high, 2),
+        "low": round(low, 2),
+        "volume": volume,
+        "change_pct": change_pct_str,
+        "summary": summary,
+        "data_source": source,
+        "data_freshness": data_freshness,
+    }
+
+
+async def _get_finnhub_snapshot(ticker: str) -> dict[str, Any]:
+    if not settings.finnhub_api_key:
+        return {"error": "Finnhub API key is not configured."}
+
+    to_epoch = int(time.time())
+    from_epoch = to_epoch - (7 * 24 * 60 * 60)
+    url = f"{_FINNHUB_BASE}/stock/candle"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            url,
+            params={
+                "symbol": ticker,
+                "resolution": "D",
+                "from": from_epoch,
+                "to": to_epoch,
+                "token": settings.finnhub_api_key,
+            },
+        )
+
+    data: dict[str, Any] = {}
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    if response.status_code == 429:
+        return {"error": "Finnhub rate limit reached."}
+
+    if response.status_code in (401, 403):
+        return {"error": "Finnhub authentication failed. Check FINNHUB_API_KEY."}
+
+    if response.status_code == 404:
+        return {"error": f"Ticker '{ticker}' was not found on Finnhub."}
+
+    if response.status_code >= 500:
+        return {"error": "Finnhub is temporarily unavailable."}
+
+    if response.status_code >= 400:
+        detail = str(data.get("error", "")).strip()
+        return {"error": detail or "Failed to fetch market data from Finnhub."}
+
+    status = str(data.get("s", "")).lower()
+    closes = data.get("c") or []
+    opens = data.get("o") or []
+    highs = data.get("h") or []
+    lows = data.get("l") or []
+    volumes = data.get("v") or []
+
+    if status != "ok" or not closes:
+        return {"error": f"No market data available for ticker '{ticker}' on Finnhub."}
+
+    idx = len(closes) - 1
+    price = float(closes[idx] or 0.0)
+    open_price = float(opens[idx] if idx < len(opens) else price)
+    high = float(highs[idx] if idx < len(highs) else price)
+    low = float(lows[idx] if idx < len(lows) else price)
+    volume = int(volumes[idx] if idx < len(volumes) else 0)
+
+    return _build_snapshot_response(
+        ticker,
+        price,
+        open_price,
+        high,
+        low,
+        volume,
+        source="Finnhub",
+        data_freshness="daily latest",
+        change_reference="daily open",
+    )
+
+
+async def _get_polygon_prev_snapshot(ticker: str) -> dict[str, Any]:
+    url = f"{_POLYGON_BASE}/v2/aggs/ticker/{ticker}/prev"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            url,
+            params={"adjusted": "true", "apiKey": settings.polygon_api_key},
+        )
+
+    data: dict[str, Any] = {}
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    if response.status_code == 429:
+        logger.warning("Polygon.io rate limit hit for ticker=%s", ticker)
+        return {
+            "error": "Polygon rate limit reached. Free tier allows 5 requests/min. Try again shortly."
+        }
+
+    if response.status_code == 404:
+        logger.info("Polygon.io ticker not found ticker=%s", ticker)
+        return {"error": f"Ticker '{ticker}' was not found on Polygon."}
+
+    if response.status_code in (401, 403):
+        message = str(data.get("message", "")).strip()
+        status = str(data.get("status", "")).strip().upper()
+        if status == "NOT_AUTHORIZED" or "not entitled" in message.lower():
+            logger.warning("Polygon.io entitlement error for ticker=%s", ticker)
+            return {
+                "error": "Your Polygon plan is not entitled for this data endpoint."
+            }
+        logger.warning("Polygon.io auth error status=%s ticker=%s", response.status_code, ticker)
+        return {"error": "Polygon authentication failed. Check POLYGON_API_KEY."}
+
+    if response.status_code >= 500:
+        logger.warning("Polygon.io upstream error status=%s ticker=%s", response.status_code, ticker)
+        return {"error": "Polygon is temporarily unavailable."}
+
+    if response.status_code >= 400:
+        logger.warning("Polygon.io request failed status=%s ticker=%s", response.status_code, ticker)
+        detail = str(data.get("message", "")).strip()
+        return {"error": detail or "Failed to fetch market data from Polygon."}
+
+    if str(data.get("status", "")).upper() == "NOT_AUTHORIZED":
+        logger.warning("Polygon.io entitlement payload returned for ticker=%s", ticker)
+        return {
+            "error": "Your Polygon plan is not entitled for this data endpoint."
+        }
+
+    results = data.get("results", [])
+    if not results:
+        logger.info("Polygon.io returned no aggregate data for ticker=%s", ticker)
+        return {"error": f"No market data available for ticker '{ticker}' on Polygon."}
+
+    bar = results[0]
+    close_price = float(bar.get("c") or 0.0)
+    open_price = float(bar.get("o") or close_price)
+    high = float(bar.get("h") or close_price)
+    low = float(bar.get("l") or close_price)
+    volume = int(bar.get("v") or 0)
+
+    payload = _build_snapshot_response(
+        ticker,
+        close_price,
+        open_price,
+        high,
+        low,
+        volume,
+        source="Polygon fallback",
+        data_freshness="EOD (previous trading day)",
+        change_reference="daily open",
+    )
+    payload["summary"] = (
+        f"{payload['summary']} Note: This is end-of-day (EOD) data served by the Polygon fallback provider."
+    )
+    return payload
 
 
 async def get_market_snapshot(ticker: str) -> dict[str, Any]:
@@ -34,49 +226,24 @@ async def get_market_snapshot(ticker: str) -> dict[str, Any]:
     dict compatible with the ``query_live_market_data`` tool schema.
     """
     ticker = ticker.upper().strip()
-    url = f"{_POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
+    primary_result = await _get_finnhub_snapshot(ticker)
+    if "error" not in primary_result:
+        return primary_result
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(url, params={"apiKey": settings.polygon_api_key})
-
-    if response.status_code == 429:
-        logger.warning("Polygon.io rate limit hit for ticker=%s", ticker)
-        return {
-            "error": "Rate limit reached. Polygon.io free tier allows 5 requests/min. Try again shortly."
-        }
-
-    response.raise_for_status()
-    data = response.json()
-
-    ticker_data = data.get("ticker", {})
-    day = ticker_data.get("day", {})
-    prev_day = ticker_data.get("prevDay", {})
-    last_trade = ticker_data.get("lastTrade", {})
-
-    current_price: float = last_trade.get("p") or day.get("c") or prev_day.get("c", 0.0)
-    prev_close: float = prev_day.get("c", current_price)
-    open_price: float = day.get("o", prev_close)
-    high: float = day.get("h", current_price)
-    low: float = day.get("l", current_price)
-    volume: int = int(day.get("v") or prev_day.get("v", 0))
-
-    change = current_price - prev_close
-    change_pct = (change / prev_close * 100) if prev_close else 0.0
-    change_pct_str = f"{change_pct:+.2f}%"
-
-    summary = (
-        f"{ticker} is trading at ${current_price:,.2f}, "
-        f"{change_pct_str} from yesterday's close, "
-        f"on volume of {volume / 1_000_000:.1f}M shares."
+    logger.warning(
+        "Finnhub primary provider failed for ticker=%s, falling back to Polygon: %s",
+        ticker,
+        primary_result.get("error", "unknown error"),
     )
 
+    fallback_result = await _get_polygon_prev_snapshot(ticker)
+    if "error" not in fallback_result:
+        return fallback_result
+
     return {
-        "ticker": ticker,
-        "price": round(current_price, 2),
-        "open": round(open_price, 2),
-        "high": round(high, 2),
-        "low": round(low, 2),
-        "volume": volume,
-        "change_pct": change_pct_str,
-        "summary": summary,
+        "error": (
+            "Market data request failed on both providers. "
+            f"Finnhub error: {primary_result.get('error', 'unknown')}. "
+            f"Polygon error: {fallback_result.get('error', 'unknown')}."
+        )
     }

@@ -12,10 +12,11 @@ QUERY_LIVE_MARKET_DATA: dict[str, Any] = {
     "toolSpec": {
         "name": "query_live_market_data",
         "description": (
-            "Fetches real-time (or latest available) price and volume data "
-            "for a US equity ticker from Polygon.io. Use this whenever the "
-            "user asks about current price, trading volume, or intraday "
-            "price action for a stock."
+            "Fetches latest available price and volume data for a US equity "
+            "ticker using Finnhub as the primary provider, with Polygon as a "
+            "fallback. If fallback is used, clearly state that the response "
+            "is end-of-day (EOD) data. Use this whenever the user asks about "
+            "current price, trading volume, or daily price action for a stock."
         ),
         "inputSchema": {
             "json": {
