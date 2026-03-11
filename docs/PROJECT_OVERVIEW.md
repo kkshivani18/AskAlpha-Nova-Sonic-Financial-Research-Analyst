@@ -133,6 +133,7 @@ Voice_AI_Agent/
 │
 ├── tests/
 │   ├── __init__.py
+│   ├── smoke_test_tools.py          # Live integration tests (real API calls, no mocks)
 │   ├── test_market_data.py
 │   ├── test_monte_carlo.py
 │   ├── test_vault_logger.py
@@ -357,32 +358,34 @@ Returns `{"status": "ok", "tools": [...]}`. Simple liveness check.
 
 **Function: `get_market_snapshot(ticker: str) -> dict`**
 
-Uses a dual-provider path:
+Uses a dual-provider path with an in-memory cache:
 
-1. **Primary:** Finnhub daily candle endpoint.
+1. **Primary:** Finnhub real-time `/quote` endpoint.
 2. **Fallback:** Polygon previous-day aggregate endpoint.
 
 Endpoints:
 
 ```
-GET https://finnhub.io/api/v1/stock/candle
+GET https://finnhub.io/api/v1/quote
 GET https://api.polygon.io/v2/aggs/ticker/{ticker}/prev?adjusted=true
 ```
 
+Results are cached in memory for **60 seconds** (`_SNAPSHOT_CACHE` dict with timestamp check). The cache is process-local and resets on server restart.
+
 Extracts and returns:
 
-| Field            | Source                                              |
-| ---------------- | --------------------------------------------------- |
-| `ticker`         | Uppercased input                                    |
-| `price`          | Latest close (`c`)                                  |
-| `open`           | Latest open (`o`)                                   |
-| `high`           | Latest high (`h`)                                   |
-| `low`            | Latest low (`l`)                                    |
-| `volume`         | Latest volume (`v`)                                 |
-| `change_pct`     | `(price - open) / open * 100` formatted as `+2.30%` |
-| `summary`        | Human-readable sentence for Nova Sonic to speak     |
-| `data_source`    | `Finnhub` or `Polygon fallback`                     |
-| `data_freshness` | `daily latest` or `EOD (previous trading day)`      |
+| Field            | Source                                                             |
+| ---------------- | ------------------------------------------------------------------ |
+| `ticker`         | Uppercased input                                                   |
+| `price`          | Latest price (`c`)                                                 |
+| `open`           | Opening price (`o`)                                                |
+| `high`           | Day high (`h`)                                                     |
+| `low`            | Day low (`l`)                                                      |
+| `volume`         | Volume (`v`) — **always 0 from Finnhub** (quote endpoint omits it) |
+| `change_pct`     | `(price - open) / open * 100` formatted as `+2.30%`                |
+| `summary`        | Human-readable sentence for Nova Sonic to speak                    |
+| `data_source`    | `Finnhub` or `Polygon fallback`                                    |
+| `data_freshness` | `real-time` or `EOD (previous trading day)`                        |
 
 If Finnhub fails and Polygon fallback is used, the summary explicitly states that the answer is **EOD fallback data**.
 
@@ -395,7 +398,7 @@ If Finnhub fails and Polygon fallback is used, the summary explicitly states tha
 Two execution paths selected at runtime:
 
 **Primary — AWS Bedrock Knowledge Base** (used when `BEDROCK_KB_ID` is set):  
-Calls `bedrock-agent-runtime.retrieve()` with a natural-language query built from `"{company} {topic} {filing_type}"`. Returns the top-3 most relevant passage texts from the vector store.
+Calls `bedrock-agent-runtime.retrieve()` with a natural-language query built from `"{company} {topic} {filing_type}"`. Applies a relevance score threshold (`MIN_SCORE = 0.50`) — passages below this score are discarded. The Bedrock KB always returns N results regardless of relevance, so sub-threshold scores indicate the company is likely not in the knowledge base.
 
 **Fallback — Local FAISS index** (used when `BEDROCK_KB_ID` is empty):  
 Loads a LlamaIndex `VectorStoreIndex` from `data/faiss_index/`. Queries with `similarity_top_k=3`. Requires the index to have been built first by running `data/build_local_index.py`.
@@ -407,7 +410,8 @@ In both cases, returns:
   "company": "Nvidia",
   "topic": "supply chain",
   "passages": ["...", "...", "..."],
-  "summary": "From Nvidia's filing on supply chain: ..."
+  "sources": ["s3://bucket/NVDA_10K_fiscal2025.pdf", "..."],
+  "summary": "From Nvidia's filing on supply chain (sources: NVDA 10K fiscal2025): ..."
 }
 ```
 
@@ -419,8 +423,8 @@ In both cases, returns:
 
 Two sub-steps:
 
-**Step 1 — Fetch live price + volatility**  
-Calls `get_market_snapshot()` for the current price. Then attempts Tiingo's `/tiingo/daily/{ticker}/prices` endpoint first (90-day window); if unavailable, it falls back to Polygon `/v2/aggs` daily bars. Realised annualised volatility is computed from closes (`std(log_returns) * sqrt(252)`). Falls back to `σ = 0.30` only if both providers fail.
+**Step 1 — Fetch live price + volatility (parallel)**  
+Fires three requests simultaneously via `asyncio.gather()`: Finnhub `/quote` for the current price, Tiingo `/tiingo/daily/{ticker}/prices` for 90-day closes (primary vol source), and Polygon `/v2/aggs` daily bars (fallback vol source). Tiingo closes are preferred; Polygon is used only if Tiingo returns ≤ 5 bars. Realised annualised volatility is computed from closes (`std(log_returns) * sqrt(252)`). Falls back to `σ = 0.30` only if both vol providers fail.
 
 **Step 2 — Run Monte Carlo**  
 Two execution paths:
@@ -442,6 +446,10 @@ Returns:
   "p50": 878.44,
   "p90": 941.33,
   "mean": 879.11,
+  "execution_mode": "native",
+  "calculation_engine": "numpy",
+  "simulation_time_seconds": 0.03,
+  "total_time_seconds": 1.67,
   "summary": "Monte Carlo on NVDA over 30 trading days ..."
 }
 ```
@@ -511,7 +519,7 @@ $$S_{t+1} = S_t \cdot \exp\!\left(-\tfrac{1}{2}\sigma^2 \,\Delta t + \sigma\sqrt
 | `_simulate_numpy()`       | NumPy importable    | Vectorised — `(simulations × days)` matrix in one shot. Fast. |
 | `_simulate_pure_python()` | NumPy not available | Stdlib-only loop. Works inside restricted Wasm environments.  |
 
-**Returns:** `{"p10": float, "p50": float, "p90": float, "mean": float}`
+**Returns:** `{"p10": float, "p50": float, "p90": float, "mean": float, "engine": str}`
 
 ---
 
@@ -582,6 +590,21 @@ Integration tests for `event_router/router.py`.
 | `test_dispatch_tool_exception_returns_error` | Backend exception is caught and returned as error dict |
 | `test_health_endpoint`                       | `GET /health` returns 200 with the tool list           |
 
+#### `tests/smoke_test_tools.py`
+
+Live integration test suite — makes **real network calls** with actual API keys. Not mocked. Run manually when you want to verify end-to-end tool behaviour.
+
+| Test                             | What it checks                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------------- |
+| Tool 1A — Live quote (GOOGL)     | Finnhub primary path returns price, open, high, low, change_pct                  |
+| Tool 1B — Cache hit              | Second identical call within 60 s is served from `_SNAPSHOT_CACHE`               |
+| Tool 1C — Polygon fallback       | Polygon EOD path is used when Finnhub key is absent; includes EOD disclosure     |
+| Tool 2A — INTC SEC RAG           | Bedrock KB returns relevant passages for a company that is in the knowledge base |
+| Tool 2B — Unknown company        | Score threshold (`MIN_SCORE = 0.50`) filters out noise for unknown companies     |
+| Tool 3A — AMD Monte Carlo (10 k) | Native numpy path runs 10,000 paths; reports engine, timing, and percentiles     |
+| Tool 3B — Low simulations        | 100-path run completes without error                                             |
+| Tool 4A — Vault logger           | Note is written to `vault/` with correct YAML front matter                       |
+
 ---
 
 ### `vault/`
@@ -594,7 +617,7 @@ Runtime directory. All Markdown notes created by Tool 4 (`log_research_insight`)
 
 | #   | Tool name                    | Backend file            | External service           | Fallback                                        |
 | --- | ---------------------------- | ----------------------- | -------------------------- | ----------------------------------------------- |
-| 1   | `query_live_market_data`     | `tools/market_data.py`  | Finnhub daily candles      | Polygon previous-day aggregate (EOD disclosure) |
+| 1   | `query_live_market_data`     | `tools/market_data.py`  | Finnhub real-time quotes   | Polygon previous-day aggregate (EOD disclosure) |
 | 2   | `analyze_sec_filings_rag`    | `tools/sec_rag.py`      | AWS Bedrock Knowledge Base | Local FAISS + LlamaIndex                        |
 | 3   | `execute_quantitative_model` | `tools/quant_model.py`  | ironclad-runtime (Wasm)    | Native Python in-process                        |
 | 4   | `log_research_insight`       | `tools/vault_logger.py` | Local filesystem           | None needed                                     |
