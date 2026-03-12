@@ -290,12 +290,12 @@ IDLE → LISTENING → MODEL_THINKING → TOOL_EXECUTING → SPEAKING → LISTEN
 
 | Method / Attribute             | What it does                                                                                                                                                                                 |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `__init__(tool_handlers)`      | Takes a `dispatch` callable from the Event Router. Creates a `NovaSonicClient` and an `asyncio.Queue` for output audio.                                                                      |
-| `start()`                      | Opens the boto3 bidirectional stream, sends `sessionStart`, transitions to `LISTENING`, starts the `_consume_output` background task.                                                        |
-| `close()`                      | Closes the boto3 stream body and sets state to `CLOSED`.                                                                                                                                     |
-| `send_audio_chunk(pcm_bytes)`  | Base64-encodes and forwards a PCM chunk to Nova Sonic. Drops chunks while in `TOOL_EXECUTING` state.                                                                                         |
+| `__init__(tool_handlers)`      | Takes a `dispatch` callable from the Event Router. Creates a `NovaSonicClient`, an `asyncio.Queue` for output audio, and initialises `_consumer_task = None`.                               |
+| `start()`                      | Opens the boto3 bidirectional stream, sends `sessionStart` (inference config + tools), sends `promptStart` (audio I/O format), transitions to `LISTENING`, stores & starts `_consume_output`. |
+| `close()`                      | Cancels the consumer task, closes the boto3 stream body, sets state to `CLOSED`.                                                                                                             |
+| `send_audio_chunk(pcm_bytes)`  | Base64-encodes and forwards a PCM chunk to Nova Sonic. Drops chunks while in `TOOL_EXECUTING` or `MODEL_THINKING` state.                                                                     |
 | `audio_output_queue`           | `asyncio.Queue[bytes]` — TTS audio chunks enqueued by `_consume_output`, drained by the WebSocket send loop.                                                                                 |
-| `_consume_output()`            | Background task. Reads events from the Nova Sonic output stream. Routes `audioOutput` to the queue, routes `toolUse` to `_handle_tool_use`, handles `contentBlockStop`/`generationComplete`. |
+| `_consume_output()`            | Background task. Spawns a daemon thread to iterate the blocking boto3 stream, forwarding parsed events via an `asyncio.Queue`. Routes `audioOutput` to the queue, `toolUse` to `_handle_tool_use`, handles `contentBlockStop`/`generationComplete`. |
 | `_handle_tool_use(tool_event)` | Extracts `name`, `toolUseId`, and `input` from the event. Calls `self._tool_handlers(name, input)`. Returns the result via `build_tool_result_event`.                                        |
 | `state`                        | Read-only property returning the current `SessionState`.                                                                                                                                     |
 

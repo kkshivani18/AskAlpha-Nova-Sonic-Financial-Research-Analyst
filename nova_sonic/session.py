@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import uuid
 from enum import Enum, auto
 from typing import Any, Callable, Awaitable
@@ -26,12 +27,12 @@ ToolHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class SessionState(Enum):
-    IDLE = auto()
-    LISTENING = auto()
-    MODEL_THINKING = auto()
+    IDLE = auto()  # 1
+    LISTENING = auto()  # 2
+    MODEL_THINKING = auto()  # 3
     TOOL_EXECUTING = auto()
     SPEAKING = auto()
-    CLOSED = auto()
+    CLOSED = auto()  # 6
 
 
 class NovaSonicSession:
@@ -56,6 +57,8 @@ class NovaSonicSession:
         self._content_id: str = str(uuid.uuid4())
         # Queue for audio output chunks to stream back to the browser
         self.audio_output_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # Background task reference (kept to prevent GC and allow cancellation)
+        self._consumer_task: asyncio.Task | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -67,13 +70,19 @@ class NovaSonicSession:
         logger.info("Opening Nova Sonic stream (prompt_id=%s)", self._prompt_id)
         self._stream = self._client.open_stream()
 
-        # Send sessionStart
+        # Send sessionStart — configures inference settings, system prompt, and tools
         start_event = self._client.build_session_start_event()
         await self._send_event(start_event)
 
+        # Send promptStart — configures audio input/output format for this prompt
+        prompt_start_event = self._client.build_audio_input_start_event(
+            self._prompt_id, self._content_id
+        )
+        await self._send_event(prompt_start_event)
+
         self._state = SessionState.LISTENING
-        # Start background task to consume model output events
-        asyncio.create_task(self._consume_output())
+        # Store task reference to prevent GC and allow cancellation on close()
+        self._consumer_task = asyncio.create_task(self._consume_output())
 
     async def close(self) -> None:
         """Gracefully close the stream."""
@@ -83,6 +92,8 @@ class NovaSonicSession:
                 self._stream["body"].close()
             except Exception:
                 pass
+        if self._consumer_task and not self._consumer_task.done():
+            self._consumer_task.cancel()
         self._state = SessionState.CLOSED
 
     # ── Audio I/O ─────────────────────────────────────────────────────────────
@@ -116,23 +127,44 @@ class NovaSonicSession:
         """
         Background task: read events from Nova Sonic output stream.
 
+        The boto3 response body is a synchronous iterator — running it directly
+        in a coroutine would block the event loop and prevent audio chunks from
+        being sent concurrently.  We push the blocking I/O into a daemon thread
+        and forward parsed events back to the event loop via an asyncio.Queue.
+
         Handles:
           - audioOutput  → enqueue PCM bytes for the browser
           - toolUse      → execute tool via Event Router, return result
           - contentBlockStop / generationComplete → state transitions
         """
+        loop = asyncio.get_running_loop()
+        event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def _blocking_reader() -> None:
+            """Runs in a daemon thread — iterates the synchronous boto3 stream."""
+            try:
+                for raw_event in self._stream["body"]:
+                    chunk_bytes = raw_event.get("chunk", {}).get("bytes", b"")
+                    if chunk_bytes:
+                        event = json.loads(chunk_bytes.decode("utf-8"))
+                        loop.call_soon_threadsafe(event_queue.put_nowait, event)
+            except Exception as exc:
+                logger.error("Stream reader thread error: %s", exc)
+            finally:
+                # None sentinel tells the async consumer the stream is done
+                loop.call_soon_threadsafe(event_queue.put_nowait, None)
+
+        reader_thread = threading.Thread(target=_blocking_reader, daemon=True)
+        reader_thread.start()
+
         try:
-            for raw_event in self._stream["body"]:
-                if self._state == SessionState.CLOSED:
+            while True:
+                event = await event_queue.get()
+                if event is None or self._state == SessionState.CLOSED:
                     break
-
-                chunk_bytes = raw_event.get("chunk", {}).get("bytes", b"")
-                if not chunk_bytes:
-                    continue
-
-                event = json.loads(chunk_bytes.decode("utf-8"))
                 await self._handle_output_event(event)
-
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             logger.error("Output stream consumer error: %s", exc)
         finally:
