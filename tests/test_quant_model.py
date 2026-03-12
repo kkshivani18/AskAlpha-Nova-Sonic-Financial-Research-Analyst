@@ -14,13 +14,62 @@ async def test_get_price_and_volatility_uses_tiingo_daily_prices():
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = [
-        {"close": 100.0, "adjClose": 99.8, "open": 99.5, "high": 100.5, "low": 99.0, "volume": 1000000},
-        {"close": 101.0, "adjClose": 100.8, "open": 100.0, "high": 101.5, "low": 100.2, "volume": 1100000},
-        {"close": 99.5, "adjClose": 99.3, "open": 101.0, "high": 101.2, "low": 99.3, "volume": 950000},
-        {"close": 102.0, "adjClose": 101.8, "open": 99.8, "high": 102.3, "low": 99.5, "volume": 1050000},
-        {"close": 103.2, "adjClose": 103.0, "open": 101.8, "high": 103.5, "low": 101.5, "volume": 1200000},
-        {"close": 104.1, "adjClose": 103.9, "open": 103.0, "high": 104.3, "low": 102.8, "volume": 1150000},
-        {"close": 103.8, "adjClose": 103.6, "open": 104.0, "high": 104.2, "low": 103.5, "volume": 1000000},
+        {
+            "close": 100.0,
+            "adjClose": 99.8,
+            "open": 99.5,
+            "high": 100.5,
+            "low": 99.0,
+            "volume": 1000000,
+        },
+        {
+            "close": 101.0,
+            "adjClose": 100.8,
+            "open": 100.0,
+            "high": 101.5,
+            "low": 100.2,
+            "volume": 1100000,
+        },
+        {
+            "close": 99.5,
+            "adjClose": 99.3,
+            "open": 101.0,
+            "high": 101.2,
+            "low": 99.3,
+            "volume": 950000,
+        },
+        {
+            "close": 102.0,
+            "adjClose": 101.8,
+            "open": 99.8,
+            "high": 102.3,
+            "low": 99.5,
+            "volume": 1050000,
+        },
+        {
+            "close": 103.2,
+            "adjClose": 103.0,
+            "open": 101.8,
+            "high": 103.5,
+            "low": 101.5,
+            "volume": 1200000,
+        },
+        {
+            "close": 104.1,
+            "adjClose": 103.9,
+            "open": 103.0,
+            "high": 104.3,
+            "low": 102.8,
+            "volume": 1150000,
+        },
+        {
+            "close": 103.8,
+            "adjClose": 103.6,
+            "open": 104.0,
+            "high": 104.2,
+            "low": 103.5,
+            "volume": 1000000,
+        },
     ]
 
     with (
@@ -47,10 +96,13 @@ async def test_get_price_and_volatility_uses_tiingo_daily_prices():
     assert price == 123.45
     assert vol > 0
 
-    _, kwargs = mock_client.get.call_args
-    assert "startDate" in kwargs["params"]
-    assert "endDate" in kwargs["params"]
-    assert kwargs["params"]["token"] == "tiingo-test-key"
+    # Both Tiingo and Polygon calls share the same mock; check that at least one
+    # call used Tiingo-style params (startDate / endDate / token).
+    all_params = [c.kwargs.get("params", {}) for c in mock_client.get.call_args_list]
+    tiingo_call = next((p for p in all_params if "startDate" in p), None)
+    assert tiingo_call is not None, f"No Tiingo call found in: {all_params}"
+    assert "endDate" in tiingo_call
+    assert tiingo_call["token"] == "tiingo-test-key"
 
 
 @pytest.mark.asyncio

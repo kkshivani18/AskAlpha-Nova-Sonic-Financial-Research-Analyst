@@ -33,6 +33,22 @@ if "config" not in sys.modules:
         aws_secret_access_key = "test-secret"
         aws_region = "us-east-1"
         nova_sonic_model_id = "amazon.nova-sonic-v1:0"
+        # market data
+        finnhub_api_key = ""
+        polygon_api_key = "test-polygon-key"
+        tiingo_api_key = ""
+        # vault / note generation
+        note_llm_provider = "none"
+        note_llm_timeout_seconds = 20
+        groq_api_key = ""
+        groq_model = "llama-3.3-70b-versatile"
+        groq_base_url = "https://api.groq.com/openai/v1"
+        nova_lite_model_id = "amazon.nova-lite-v1:0"
+        # misc
+        log_level = "INFO"
+        vault_path = (
+            None  # individual tests override via patch("tools.vault_logger.settings")
+        )
 
     config_stub.settings = _SettingsStub()
     sys.modules["config"] = config_stub

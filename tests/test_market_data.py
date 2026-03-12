@@ -79,6 +79,7 @@ async def test_get_market_snapshot_falls_back_to_polygon_with_eod_notice(
 
     with (
         patch("tools.market_data.httpx.AsyncClient") as mock_client_cls,
+        patch("tools.market_data._SNAPSHOT_CACHE", {}),
         patch.object(
             __import__("tools.market_data", fromlist=["settings"]).settings,
             "finnhub_api_key",
@@ -152,6 +153,7 @@ async def test_get_market_snapshot_both_providers_fail_returns_combined_error():
 
     with (
         patch("tools.market_data.httpx.AsyncClient") as mock_client_cls,
+        patch("tools.market_data._SNAPSHOT_CACHE", {}),
         patch.object(
             __import__("tools.market_data", fromlist=["settings"]).settings,
             "finnhub_api_key",
