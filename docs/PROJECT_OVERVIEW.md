@@ -102,8 +102,20 @@ Voice_AI_Agent/
 ├── main.py                      # FastAPI app factory & entry point
 ├── config.py                    # Pydantic settings (reads .env)
 ├── requirements.txt             # Python dependencies
+├── pytest.ini                   # pytest asyncio_mode = auto
 ├── .env.example                 # Template — copy to .env and fill in keys
 ├── .gitignore
+├── test.excalidraw              # Architecture whiteboard sketch
+│
+├── frontend/                    # React + Vite + TypeScript Web UI
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tailwind.config.js
+│   └── src/
+│       ├── App.tsx              # Root app + routing (/  and /vault/:filename)
+│       ├── main.tsx
+│       └── components/          # 12 UI components (see §frontend)
 │
 ├── nova_sonic/                  # AWS Bedrock / Nova Sonic layer
 │   ├── __init__.py
@@ -113,7 +125,7 @@ Voice_AI_Agent/
 │
 ├── event_router/                # Dispatch layer between Nova Sonic and tools
 │   ├── __init__.py
-│   ├── router.py                # WebSocket endpoint + REST endpoint + dispatch()
+│   ├── router.py                # WebSocket + REST endpoints + dispatch()
 │   └── schemas.py               # Pydantic request/response models
 │
 ├── tools/                       # Four financial tool backends
@@ -134,14 +146,31 @@ Voice_AI_Agent/
 ├── tests/
 │   ├── __init__.py
 │   ├── smoke_test_tools.py          # Live integration tests (real API calls, no mocks)
+│   ├── test_nova_sonic_client.py    # Unit tests for NovaSonicClient event builders
+│   ├── test_nova_sonic_session.py   # Unit tests for NovaSonicSession state machine
 │   ├── test_market_data.py
 │   ├── test_monte_carlo.py
+│   ├── test_quant_model.py          # Integration tests for quant_model tool
 │   ├── test_vault_logger.py
-│   └── test_event_router.py
+│   ├── test_event_router.py
+│   ├── test_api.py                  # REST endpoint integration tests
+│   ├── test_complete_setup.py       # End-to-end session setup validation
+│   ├── test_web_ui_debug.py         # Web UI / WebSocket debug test
+│   ├── test_audio_with_tools.py     # Live audio + tool calling integration test
+│   ├── test_bidirectional_audio.py  # Bidirectional stream tests
+│   ├── test_tools_standalone.py     # Standalone tool function tests
+│   ├── bedrock_first_req.py         # Manual Bedrock connection probe
+│   └── nova_sonic_simple.py         # Minimal Nova Sonic session smoke test
 │
 ├── vault/                       # Markdown notes saved by Tool 4
 └── docs/
-    └── PROJECT_OVERVIEW.md      # ← you are here
+    ├── PROJECT_OVERVIEW.md      # ← you are here
+    ├── Nova_Sonic_implementation_with_tools.md
+    ├── BIDIRECTIONAL_AUDIO_TEST.md
+    ├── VAULT_LOGGER_DEEP_DIVE.md
+    ├── Impl_AWS_AI_Hackathon.md
+    ├── README_nova_sonic_tests.md
+    └── learning.md
 ```
 
 ---
@@ -252,6 +281,17 @@ Template showing every supported environment variable with placeholder values. C
 
 ---
 
+#### `pytest.ini`
+
+Configures pytest for the entire project. Sets `asyncio_mode = auto` — without this, every `async def test_*` function would require an explicit `@pytest.mark.asyncio` decorator and would otherwise be silently skipped. Required because the majority of tests exercise async tool functions and session methods.
+
+```ini
+[pytest]
+asyncio_mode = auto
+```
+
+---
+
 ### `nova_sonic/`
 
 #### `nova_sonic/tool_schemas.py`
@@ -315,13 +355,17 @@ IDLE → LISTENING → MODEL_THINKING → TOOL_EXECUTING → SPEAKING → LISTEN
 
 | Method / Attribute             | What it does                                                                                                                                                                                                                                        |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `__init__(tool_handlers)`      | Takes a `dispatch` callable from the Event Router. Creates a `NovaSonicClient`, an `asyncio.Queue` for output audio, and initialises `_consumer_task = None`.                                                                                       |
-| `start()`                      | Opens the boto3 bidirectional stream, sends `sessionStart` (inference config + tools), sends `promptStart` (audio I/O format), transitions to `LISTENING`, stores & starts `_consume_output`.                                                       |
+| `__init__(tool_handlers)`      | Takes a `dispatch` callable from the Event Router. Creates a `NovaSonicClient`, an `asyncio.Queue` for output audio, a `metadata_queue` for JSON events, and initialises `_consumer_task = None`.                                                   |
+| `start()`                      | Opens the boto3 bidirectional stream, sends `sessionStart` (inference config + tools), transitions to `LISTENING`, stores & starts `_consume_output`. Does **not** send the audio prompt start — that is deferred to `start_audio_input()`.         |
+| `start_audio_input()`          | Sends the `promptStart` event (audio I/O format) to Nova Sonic, signalling that the user is about to speak. Called by the router's `receive_loop` on the first audio frame of each utterance.                                                       |
+| `end_audio_input()`            | Sends `contentEnd` to Nova Sonic, signalling the end of the user's audio input for the current turn.                                                                                                                                                |
+| `start_next_prompt()`          | Resets prompt/content IDs and sends a fresh `promptStart` event for the next conversational turn, enabling multi-turn conversations within a single WebSocket connection.                                                                            |
 | `close()`                      | Cancels the consumer task, closes the boto3 stream body, sets state to `CLOSED`.                                                                                                                                                                    |
 | `send_audio_chunk(pcm_bytes)`  | Base64-encodes and forwards a PCM chunk to Nova Sonic. Drops chunks while in `TOOL_EXECUTING` or `MODEL_THINKING` state.                                                                                                                            |
-| `audio_output_queue`           | `asyncio.Queue[bytes]` — TTS audio chunks enqueued by `_consume_output`, drained by the WebSocket send loop.                                                                                                                                        |
-| `_consume_output()`            | Background task. Spawns a daemon thread to iterate the blocking boto3 stream, forwarding parsed events via an `asyncio.Queue`. Routes `audioOutput` to the queue, `toolUse` to `_handle_tool_use`, handles `contentBlockStop`/`generationComplete`. |
-| `_handle_tool_use(tool_event)` | Extracts `name`, `toolUseId`, and `input` from the event. Calls `self._tool_handlers(name, input)`. Returns the result via `build_tool_result_event`.                                                                                               |
+| `audio_output_queue`           | `asyncio.Queue[bytes]` — raw PCM TTS chunks enqueued by `_consume_output`, drained by the WebSocket send loop and sent as binary frames to the browser.                                                                                             |
+| `metadata_queue`               | `asyncio.Queue[dict]` — JSON metadata events (transcripts, tool results, `response_complete`) enqueued by `_consume_output`, drained by the WebSocket send loop and sent as JSON text frames to the browser.                                        |
+| `_consume_output()`            | Background task. Spawns a daemon thread to iterate the blocking boto3 stream, forwarding parsed events via async queues. Routes `audioOutput` to `audio_output_queue`, `toolUse` to `_handle_tool_use`, pushes transcript/completion events to `metadata_queue`. |
+| `_handle_tool_use(tool_event)` | Extracts `name`, `toolUseId`, and `input` from the event. Calls `self._tool_handlers(name, input)`. Returns the result via `build_tool_result_event`. Also pushes a `tool_result` metadata event for the frontend.                                  |
 | `state`                        | Read-only property returning the current `SessionState`.                                                                                                                                                                                            |
 
 ---
@@ -368,8 +412,10 @@ If the backend raises, catches the exception and returns `{"error": "<message>"}
 **2. `GET /ws/voice` — WebSocket endpoint**  
 Accepts a browser connection, creates a `NovaSonicSession`, then runs two concurrent coroutines:
 
-- `receive_loop` — reads binary frames from the browser, calls `session.send_audio_chunk()`
-- `send_loop` — drains `session.audio_output_queue` and sends PCM bytes back to the browser
+- `receive_loop` — reads binary frames (PCM audio) and JSON control messages from the browser. Recognises two control message types:
+  - `{"type": "startAudio"}` — marks the start of a new user utterance; calls `session.start_audio_input()` and, for subsequent turns, `session.start_next_prompt()` to reset the stream for the next exchange.
+  - `{"type": "endAudio"}` — signals the end of the utterance; calls `session.end_audio_input()`.
+- `send_loop` — drains both `session.audio_output_queue` (raw PCM bytes sent as binary WebSocket frames) and `session.metadata_queue` (JSON events such as transcripts, tool results, and `response_complete` sent as text frames).
 
 The session is torn down cleanly on disconnect.
 
@@ -378,6 +424,12 @@ Direct HTTP access to the vault logger. Accepts a `VaultLogRequest` JSON body. U
 
 **4. `GET /health`**  
 Returns `{"status": "ok", "tools": [...]}`. Simple liveness check.
+
+**5. `GET /vault/files` — REST endpoint**  
+Lists all `.md` files in the vault directory. Returns a JSON array sorted by modification time (newest first), each entry containing `filename`, `modified` (Unix timestamp), and `size` (bytes). Used by the frontend Vault Panel to display the file list.
+
+**6. `GET /vault/files/{filename}` — REST endpoint**  
+Reads and returns the raw Markdown content of a specific vault file. Includes a directory-traversal guard (`filepath.resolve().is_relative_to(vault_dir.resolve())`) — requests that escape the vault directory are rejected with HTTP 403. Only `.md` files are served; other extensions return HTTP 400.
 
 ---
 
@@ -702,6 +754,155 @@ Live integration test suite — makes **real network calls** with actual API key
 | Tool 3A — AMD Monte Carlo (10 k) | Native numpy path runs 10,000 paths; reports engine, timing, and percentiles                               |
 | Tool 3B — Low simulations        | 100-path run completes without error                                                                       |
 | Tool 4A — Vault logger           | Note is written with rich YAML front matter, seven structured sections, and LLM-generated content via Groq |
+
+#### `tests/test_nova_sonic_client.py`
+
+Unit tests for `nova_sonic/client.py` event builders. All tests run without real AWS credentials — `boto3` is fully stubbed at import time.
+
+| Test | What it checks |
+| ---- | -------------- |
+| `test_build_session_start_event_contains_expected_sections` | `sessionStart` contains the system prompt, all four tool schemas, and inference config (`maxTokens`, `topP`, `temperature`) |
+| `test_build_audio_input_start_event_uses_expected_audio_formats` | Input audio spec: `audio/lpcm`, 16 kHz, 16-bit, mono, base64, `SPEECH` type. Output: 24 kHz, voice `matthew` |
+| `test_build_audio_chunk_event_contains_prompt_content_and_payload` | `audioInput` event carries correct `promptId`, `contentId`, and base64 payload |
+| `test_build_tool_result_event_serializes_result_json` | Tool result dict is JSON-serialised into `toolResult.content[0].text`; status is `success` |
+
+#### `tests/test_nova_sonic_session.py`
+
+Unit tests for `nova_sonic/session.py` state machine. Fully mocked — no real AWS calls.
+
+| Test | What it checks |
+| ---- | -------------- |
+| `test_start_transitions_to_listening_and_sends_start_events` | `session.start()` reaches `LISTENING`, sends `sessionStart` and `promptStart` events, creates consumer task |
+| `test_send_audio_chunk_drops_audio_while_tool_executing` | Audio drop in `TOOL_EXECUTING` state |
+| `test_send_audio_chunk_sends_event_while_listening` | Correct base64-encoded `audioInput` event is sent in `LISTENING` state |
+| `test_handle_output_event_audio_output_enqueues_pcm_and_sets_speaking` | PCM decoded from base64 and enqueued; state → `SPEAKING` |
+| `test_handle_output_event_generation_complete_sets_listening` | `generationComplete` event resets state → `LISTENING` |
+| `test_handle_tool_use_success_sends_tool_result_and_returns_to_listening` | Tool handler called with correct args; result sent back; state → `LISTENING` |
+| `test_handle_tool_use_exception_returns_error_payload` | Handler exception produces `{"error": ...}` result without crashing the session |
+| `test_close_closes_stream_and_cancels_consumer_task` | `close()` calls `body.close()`, cancels task, sets state → `CLOSED` |
+| `test_consume_output_dispatches_events_from_stream_chunks` | `_consume_output()` iterates boto3 stream chunks, dispatches parsed events, closes on `generationComplete` |
+
+#### `tests/test_quant_model.py`
+
+Integration tests for `tools/quant_model.py` (Monte Carlo tool). Covers the full tool function including parallel data fetching (Tiingo + Polygon) and native Python simulation path.
+
+#### `tests/test_api.py`
+
+REST endpoint integration tests. Tests `GET /health`, `POST /vault/log`, `GET /vault/files`, and `GET /vault/files/{filename}` using FastAPI's `TestClient`. Verifies response shapes and status codes without real AWS credentials.
+
+#### `tests/test_complete_setup.py`
+
+End-to-end session setup validation. Checks that the full FastAPI app boots, the router registers correctly, and the WebSocket endpoint exists — all without sending real audio.
+
+#### `tests/test_web_ui_debug.py`
+
+WebSocket protocol debug test. Connects to the running server's `/ws/voice` endpoint, sends a `startAudio` control message and a short silence buffer, and logs all responses. Used during development to trace the event flow. Output is saved to `tests/test_web_ui_debug.log`.
+
+#### `tests/test_audio_with_tools.py`
+
+Full live audio + tool-calling integration test. Captures real microphone input, sends it through the WebSocket pipeline to Nova Sonic, and waits for tool events and audio output. Requires a running server and valid AWS credentials.
+
+#### `tests/test_bidirectional_audio.py`
+
+Tests the bidirectional stream protocol directly against the Bedrock API. Validates that the `InvokeModelWithBidirectionalStream` connection opens, events are sent, and audio chunks are received back.
+
+#### `tests/test_tools_standalone.py`
+
+Calls each of the four tool functions (`get_market_snapshot`, `query_sec_filings`, `run_monte_carlo`, `log_insight`) in isolation with minimal scaffolding. Useful for verifying a single tool without going through the full session pipeline.
+
+#### `tests/bedrock_first_req.py`
+
+Manual Bedrock connection probe — a minimal standalone script that opens a raw `InvokeModelWithBidirectionalStream` call and prints what comes back. Used to diagnose AWS credential or endpoint issues before running the full stack.
+
+#### `tests/nova_sonic_simple.py`
+
+Minimal Nova Sonic session smoke test. Establishes a session, sends a single hard-coded audio buffer, and prints all received events. Used as a quick sanity check that Nova Sonic is reachable and responding.
+
+---
+
+### `frontend/`
+
+React + Vite + TypeScript single-page application that provides the browser UI. Communicates with the backend over a single WebSocket (`/ws/voice`) for audio streaming and receives JSON metadata events (transcripts, tool results) on the same connection. Contacts the vault REST endpoints over plain HTTP.
+
+**Tech stack:**
+
+| Package | Purpose |
+| ------- | ------- |
+| `react` 19 | UI framework |
+| `vite` 8 | Dev server + production bundler |
+| `typescript` 5.9 | Type safety |
+| `tailwindcss` 4 | Utility-first styling |
+| `framer-motion` | Micro-animations and transitions |
+| `lucide-react` | Icon set |
+| `react-router-dom` 6 | Client-side routing (`/` and `/vault/:filename`) |
+| `clsx` + `tailwind-merge` | Conditional class merging utility (`cn()`) |
+
+**Audio pipeline (browser side):**
+
+The frontend uses the Web Audio API directly — no external audio library:
+
+1. `getUserMedia` captures microphone input at 16 kHz, mono, with echo cancellation and noise suppression.
+2. An `AudioWorkletNode` (`/audio-processor.js` in `public/`) processes raw PCM from the mic and emits chunks via `postMessage`.
+3. Each chunk is sent as a binary WebSocket frame to the server.
+4. Incoming binary WebSocket frames (Nova Sonic TTS output, 24 kHz PCM) are decoded from `Int16Array` to `Float32Array` and scheduled on an `AudioContext` using a gapless timestamp queue (`nextPlayTimeRef`).
+
+**WebSocket control protocol:**
+
+| Browser → Server | Meaning |
+| ---------------- | ------- |
+| Binary frame | Raw PCM-16 @ 16 kHz audio chunk |
+| `{"type": "startAudio"}` | User started speaking (new turn) |
+| `{"type": "endAudio"}` | User stopped speaking |
+
+| Server → Browser | Meaning |
+| ---------------- | ------- |
+| Binary frame | Raw PCM-16 @ 24 kHz TTS audio chunk |
+| `{"type": "user_transcript", "text": ...}` | Streaming ASR transcript of what the user said |
+| `{"type": "transcript", "text": ...}` | Streaming ASR transcript of Nova's response |
+| `{"type": "tool_result", "tool_name": ..., "result": ...}` | Tool output for the Query Stream panel |
+| `{"type": "response_complete"}` | Full turn is done; transcripts are committed to chat history |
+
+**Multi-turn support:**
+
+On each `startAudio` message after the first response, the router calls `session.start_next_prompt()` to reset the prompt/content IDs for the next conversational turn. The frontend tracks `response_count` to know when to trigger this. This allows back-and-forth conversation without reconnecting the WebSocket.
+
+**Reconnect logic:**
+
+The WebSocket client uses exponential back-off (up to 10 s, max 5 attempts) to reconnect automatically if the connection drops.
+
+**Routes:**
+
+| Path | Component | What it shows |
+| ---- | --------- | ------------- |
+| `/` | `MainApp` | Full three-panel layout: Chat Session, Voice Interface, Vault + Query Stream |
+| `/vault/:filename` | `VaultViewerPage` → `VaultViewer` | Full Markdown render of a single vault note |
+
+**Components (`frontend/src/components/`):**
+
+| File | Purpose |
+| ---- | ------- |
+| `Panel.tsx` | Reusable dark-glass panel shell with icon + title header and optional right-slot action |
+| `MessageBubble.tsx` | Single chat message bubble (user vs. assistant style) |
+| `ChatSession.tsx` | Scrollable conversation history built from `MessageBubble` items |
+| `VoiceInterface.tsx` | Central panel with the mic button, waveform, and live transcript display |
+| `VoiceVisualizer.tsx` | Animated audio waveform SVG that pulses when `isActive` is true |
+| `ParticleWave.tsx` | Canvas-based particle animation used as background visual element |
+| `QueryStreamPanel.tsx` | Right-panel wrapper for the tool-result display |
+| `FormattedResult.tsx` | Renders structured tool results (market data, Monte Carlo percentiles, vault saves) with labelled fields per tool type |
+| `VaultPanel.tsx` | Lists vault files from `GET /vault/files`, sorted by modification time, with a refresh button |
+| `VaultFileItem.tsx` | Single vault file row with filename, relative timestamp, and click-to-open navigation |
+| `VaultViewer.tsx` | Fetches and renders a single vault Markdown file via `GET /vault/files/{filename}` |
+| `index.ts` | Barrel export for all components |
+
+**Running the frontend:**
+
+```bash
+cd frontend
+npm install
+npm run dev   # dev server at http://localhost:5173
+```
+
+The Vite dev server proxies WebSocket and REST calls to `http://localhost:8000`. In production, serve the built output (`npm run build` → `dist/`) behind the same FastAPI server or a reverse proxy.
 
 ---
 
