@@ -151,60 +151,38 @@ async def voice_websocket(websocket: WebSocket) -> None:
             """Receive both audio (binary) and control messages (JSON) from browser."""
             nonlocal audio_bytes_count, audio_input_started, audio_input_ended, response_count
             try:
-                logger.info("🚀 Receive loop started — waiting for browser audio...")
                 while session.state.name != "CLOSED":
                     try:
-                        # After endAudio, only wait briefly for possible late messages
                         timeout = 0.1 if audio_input_ended else 0.5
                         message = await asyncio.wait_for(websocket.receive(), timeout=timeout)
                         
                         if message["type"] == "websocket.disconnect":
-                            logger.info("Browser disconnected (receive)")
                             break
                         elif message["type"] == "websocket.receive":
-                            # Binary audio chunk from browser
                             if "bytes" in message:
                                 if not audio_input_started:
-                                    logger.info("")
-                                    logger.info("🎤 [AUDIO INPUT STARTING] First frame received from browser")
-                                    logger.info("    Opening Nova Sonic audio content block...")
                                     await session.start_audio_input()
                                     audio_input_started = True
-                                    logger.info("    ✓ Audio block opened")
-                                    logger.info("")
 
                                 audio_bytes_count += 1
                                 await session.send_audio_chunk(message["bytes"])
-                                if audio_bytes_count % 50 == 0:
-                                    logger.debug("  → Sent %d audio chunks to Nova", audio_bytes_count)
                             
                             # Text control message from browser
                             elif "text" in message:
                                 try:
                                     control_msg = json.loads(message["text"])
-                                    logger.info("📨 Received control: %s", control_msg.get("type"))
                                     
                                     if control_msg.get("type") == "startAudio":
-                                        logger.info("  Resetting for new conversation...")
                                         audio_input_ended = False
                                         audio_bytes_count = 0
                                         
                                         if response_count > 0:
-                                            logger.info("  Starting new prompt cycle for request #%d", response_count + 1)
                                             try:
                                                 await session.start_next_prompt()
                                             except Exception as e:
-                                                logger.error("✗ Failed to start next prompt: %s", e, exc_info=True)
-                                        
-                                        logger.info("  (ready for first binary frame)")
+                                                logger.error("Failed to start next prompt: %s", e)
 
                                     elif control_msg.get("type") == "endAudio":
-                                        logger.info("")
-                                        logger.info("="*80)
-                                        logger.info("⏹ [AUDIO INPUT ENDED] Browser sent %d audio chunks", audio_bytes_count)
-                                        logger.info("  Finalizing audio block & telling Nova to process...")
-                                        logger.info("="*80)
-                                        logger.info("")
                                         await session.end_audio_input()
                                         audio_input_started = False
                                         audio_input_ended = True
@@ -240,21 +218,12 @@ async def voice_websocket(websocket: WebSocket) -> None:
                                 await websocket.send_bytes(pcm_chunk)
                                 audio_sent += 1
                                 send_errors = 0  # Reset error counter on success
-                                if audio_sent == 1:
-                                    logger.info("")
-                                    logger.info("="*80)
-                                    logger.info("🔊 [AUDIO STREAMING TO BROWSER] Response audio flowing...")
-                                    logger.info("="*80)
-                                    logger.info("")
-                                if audio_sent % 10 == 0:
-                                    logger.debug("  → Sent %d audio chunks to browser", audio_sent)
                             except (WebSocketDisconnect, RuntimeError) as send_err:
                                 send_errors += 1
                                 logger.warning("Audio send error #%d: %s", send_errors, send_err)
                                 if send_errors >= max_send_errors:
                                     logger.error("Max audio send errors reached, exiting send_loop")
                                     break
-                                # Don't break immediately — retry next iteration
                                 await asyncio.sleep(0.05)
                         except asyncio.TimeoutError:
                             pass
@@ -266,23 +235,8 @@ async def voice_websocket(websocket: WebSocket) -> None:
                             )
                             event_type = metadata.get("type", "unknown")
                             
-                            # Log event content
-                            if event_type == "user_transcript":
-                                logger.debug("  📤 → Browser: user_transcript: %s", metadata.get("text", "")[:50])
-                            elif event_type == "transcript":
-                                logger.debug("  📤 → Browser: response_text: %s", metadata.get("text", "")[:50])
-                            elif event_type == "tool_call":
-                                logger.info("  🔧 → Browser: Calling tool %s", metadata.get("tool_name", ""))
-                            elif event_type == "tool_result":
-                                logger.info("  ✓ → Browser: Tool returned data")
-                            elif event_type == "response":
-                                logger.debug("  📝 → Browser: response: %s", metadata.get("text", "")[:50])
-                            elif event_type == "response_complete":
-                                logger.info("")
-                                logger.info("="*80)
-                                logger.info("✓ RESPONSE COMPLETE (#%d) — Ready for next question", response_count + 1)
-                                logger.info("="*80)
-                                logger.info("")
+                            # Handle response_complete specially (marks end of response)
+                            if event_type == "response_complete":
                                 response_count += 1
                                 try:
                                     await websocket.send_json(metadata)
@@ -292,6 +246,7 @@ async def voice_websocket(websocket: WebSocket) -> None:
                                     break
                                 continue
                             
+                            # Send other metadata events
                             try:
                                 await websocket.send_json(metadata)
                                 metadata_sent += 1

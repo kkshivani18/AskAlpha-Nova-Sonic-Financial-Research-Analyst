@@ -145,23 +145,8 @@ class NovaSonicSession:
 
         except Exception as e:
             logger.error("")
-            logger.error("="*80)
-            logger.error("✗✗✗ SESSION INITIALIZATION FAILED ✗✗✗")
-            logger.error("="*80)
             logger.error("Exception Type: %s", type(e).__name__)
             logger.error("Exception Message: %s", str(e))
-            logger.error("")
-            logger.error("DEBUGGING CHECKLIST:")
-            logger.error("  1️⃣  AWS credentials configured?")
-            logger.error("       Run: echo $AWS_ACCESS_KEY_ID; echo $AWS_SECRET_ACCESS_KEY")
-            logger.error("  2️⃣  Credentials valid? (not expired)")
-            logger.error("       Check AWS Management Console > Security Credentials")
-            logger.error("  3️⃣  Region correct? (should be us-east-1)")
-            logger.error("       Nova Sonic may not be available in all regions")
-            logger.error("  4️⃣  Bedrock permissions? (need bedrock:* IAM permissions)")
-            logger.error("       Check IAM policy for your access key")
-            logger.error("  5️⃣  Model available? (amazon.nova-2-sonic-v1:0)")
-            logger.error("       Check AWS Bedrock console for model access")
             logger.error("")
             logger.error("Full Traceback:")
             import traceback
@@ -273,7 +258,6 @@ class NovaSonicSession:
             logger.warning("Blocked: no audio content block open yet")
             return
         audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
-        logger.debug("→ Sending %d byte audio chunk to Nova Sonic", len(pcm_bytes))
         await self._send_event({
             "event": {
                 "audioInput": {
@@ -311,42 +295,22 @@ class NovaSonicSession:
         await self._client.send_event(self._stream, event)
 
     async def _consume_output(self) -> None:
-        """
-        Read events from Nova Sonic.
-
-        ROOT CAUSE FIX: The previous code used
-            async for event_chunk in self._stream.output_stream
-        which is NOT a valid iterator on the AWS SDK v2 — it never yields,
-        so input_stream.send() blocked forever waiting for a reader, causing
-        the stream to time out after ~42 seconds on every single connection.
-
-        The correct AWS SDK v2 pattern (from every AWS reference, the medium
-        article, and test_audio_with_tools.py) is:
-            output = await self._stream.await_output()
-            result = await output[1].receive()
-        """
-        logger.info("CONSUMER: started — using await_output() (correct SDK v2 API)")
+        """Read events from Nova Sonic using the correct AWS SDK v2 API (await_output)."""
         event_count = 0
         consecutive_errors = 0
 
         try:
-            logger.info("CONSUMER: Waiting for first event from Nova Sonic (timeout=30s)...")
             while self._state != SessionState.CLOSED:
                 try:
-                    logger.debug("CONSUMER: Calling await_output()...")
                     try:
                         output = await asyncio.wait_for(self._stream.await_output(), timeout=30.0)
-                        logger.debug("CONSUMER: await_output() succeeded, type=%s", type(output))
                     except asyncio.TimeoutError:
-                        logger.error("✗ CONSUMER: await_output() timed out after 30 seconds!")
-                        logger.error("  This usually means: AWS credentials invalid, region wrong, or model unavailable")
+                        logger.error("Stream timeout: AWS not responding after 30s. Check credentials and model access.")
                         raise RuntimeError("Stream timeout: AWS not responding after 30s. Check credentials and model access.")
                     
-                    logger.debug("CONSUMER: Calling receive()...")
                     result = await output[1].receive()
 
                     if not result.value or not result.value.bytes_:
-                        logger.debug("Received empty result, continuing...")
                         consecutive_errors = 0
                         continue
 
@@ -360,11 +324,9 @@ class NovaSonicSession:
                         continue
 
                     if "event" not in raw:
-                        logger.debug("No event key in raw: %s", list(raw.keys()))
                         continue
 
                     event_keys = list(raw["event"].keys())
-                    logger.info("EVENT #%d: %s", event_count, event_keys)
                     
                     try:
                         await self._handle_output_event(raw["event"])
@@ -385,74 +347,51 @@ class NovaSonicSession:
                         break
                     consecutive_errors += 1
                     error_msg = str(e)
+                    logger.error("Event read error: %s", error_msg)
                     
-                    # Log with detail for debugging
-                    logger.error(
-                        "Event read error #%d (consecutive_error=%d/%d): %s",
-                        event_count, consecutive_errors, 10, error_msg
-                    )
-                    
-                    # Certain errors are recoverable (transient AWS issues)
-                    # Only break on truly fatal errors
                     if "Invalid input request" in error_msg or "AWS_ERROR" in error_msg:
-                        # These errors can happen when tools fail or input is malformed
-                        # Emit an error event to frontend but keep session alive for next prompt
                         try:
                             await self.metadata_queue.put({
-                                "type": "response_complete",  # Commit incomplete response
+                                "type": "response_complete",
                                 "error": error_msg
                             })
                         except:
                             pass
-                        consecutive_errors = 0  # Reset counter — model error doesn't mean consumer is broken
+                        consecutive_errors = 0
                         await asyncio.sleep(0.2)
                         continue
                     
-                    # Reset counter after a longer sequence (10 instead of 5)
-                    # Only exit if absolutely cannot recover
                     if consecutive_errors >= 10:
-                        logger.error("✗ Too many consecutive errors (#%d), consumer giving up", consecutive_errors)
+                        logger.error("Too many consecutive errors, stopping consumer")
                         break
-                    # Brief backoff before retrying
                     await asyncio.sleep(0.1)
 
         except asyncio.CancelledError:
-            logger.info("Consumer cancelled at top level")
+            logger.info("Consumer task cancelled")
         except Exception as exc:
-            logger.error("Consumer fatal error: %s", exc, exc_info=True)
+            logger.error("Consumer error: %s", exc)
         finally:
-            logger.info("Consumer done after %d events", event_count)
-            # Only close if explicitly requested, not after each prompt
-            # This allows multiple prompts in the same session
-            if self._state == SessionState.CLOSED:
-                logger.info("Session explicitly closed")
-            else:
-                logger.info("Prompt cycle complete, but session remains open for next prompt")
+            logger.debug("Consumer finished after %d events", event_count)
 
     async def _handle_output_event(self, event: dict[str, Any]) -> None:
 
         if "audioOutput" in event:
             audio_b64: str = event["audioOutput"].get("content", "")
             pcm = base64.b64decode(audio_b64)
-            self._audio_chunks_received += 1  # ← TRACK AUDIO
-            if self._audio_chunks_received == 1:
-                logger.info("")
-                logger.info("="*80)
-                logger.info("🔊 [AUDIO OUTPUT STARTED] Nova Sonic is synthesizing response audio...")
-                logger.info("="*80)
-                logger.info("")
-            logger.info("  📻 [AUDIO] response chunk #%d: %d bytes", self._audio_chunks_received, len(pcm))
+            self._audio_chunks_received += 1
             
-            # Put audio without blocking to prevent queue backups
+            if self._audio_chunks_received == 1:
+                logger.info("Audio output started")
+            
             try:
                 self.audio_output_queue.put_nowait(pcm)
             except asyncio.QueueFull:
-                logger.warning("Audio queue full, dropping oldest chunk")
+                logger.warning("Audio queue overflow, dropping oldest chunk")
                 try:
                     self.audio_output_queue.get_nowait()
                     self.audio_output_queue.put_nowait(pcm)
                 except asyncio.QueueEmpty:
-                    logger.warning("Audio queue error, skipping chunk")
+                    pass
             
             self._state = SessionState.SPEAKING
 
@@ -497,8 +436,7 @@ class NovaSonicSession:
                     await self.metadata_queue.put({"type": "transcript", "text": chunk})
 
         elif "toolUse" in event:
-            # Buffer the toolUse payload — Nova Sonic sends name+input here but we
-            # must wait for the matching contentEnd before the payload is complete.
+            # buffer the toolUse payload — Nova Sonic sends name+input 
             self._pending_tool_use = event["toolUse"]
             logger.info("  [TOOL] toolUse buffered: keys=%s", list(event["toolUse"].keys()))
 
@@ -513,7 +451,7 @@ class NovaSonicSession:
             logger.info("  [FLOW] contentEnd role=%s", role)
 
             if role == "TOOL" and self._pending_tool_use is not None:
-                # Now the full toolUse payload is committed — execute the tool
+                # the full toolUse payload is committed 
                 tool_event = self._pending_tool_use
                 self._pending_tool_use = None
                 self._current_block_role = None
@@ -523,9 +461,6 @@ class NovaSonicSession:
                 prev_role = self._current_block_role
                 self._current_block_role = None
                 self._state = SessionState.LISTENING
-                # Nova Sonic does NOT send generationComplete — the turn ends with
-                # the last ASSISTANT TEXT contentEnd. Emit response_complete here so
-                # the frontend commits the full turn to the chat panel.
                 if prev_role == "ASSISTANT":
                     logger.info("  [FLOW] ASSISTANT TEXT ended → emitting response_complete")
                     await self.metadata_queue.put({"type": "response_complete"})
@@ -549,12 +484,9 @@ class NovaSonicSession:
             logger.debug("  [?] unhandled: %s", list(event.keys()))
 
     async def _handle_tool_use(self, tool_event: dict[str, Any]) -> None:
-        # Extract tool name: check both "name" and "toolName" (SDK variations)
         tool_name: str = tool_event.get("name") or tool_event.get("toolName") or ""
         tool_use_id: str = tool_event.get("toolUseId", "")
 
-        # Nova Sonic sends `input` as a JSON-encoded STRING, not a dict.
-        # The test harness handles this with json.loads(); we must do the same.
         raw_input = tool_event.get("input") or tool_event.get("content", {})
         if isinstance(raw_input, str):
             try:

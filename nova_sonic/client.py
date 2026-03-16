@@ -248,9 +248,7 @@ class NovaSonicClient:
             event_json = json.dumps(event).encode("utf-8")
             payload_part = BidirectionalInputPayloadPart(bytes_=event_json)
             chunk = InvokeModelWithBidirectionalStreamInputChunk(value=payload_part)
-            logger.debug("Sending event: %s (size=%d bytes)", list(event.get("event", {}).keys()), len(event_json))
             await stream.input_stream.send(chunk)
-            logger.debug("✓ Event sent successfully")
         except Exception as exc:
             logger.error("Error sending event to Nova Sonic: %s | event_keys=%s", exc, list(event.get("event", {}).keys()))
             import traceback
