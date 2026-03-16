@@ -144,11 +144,12 @@ async def voice_websocket(websocket: WebSocket) -> None:
 
         audio_bytes_count = 0
         audio_input_started = False
-        audio_input_ended = False  # ← Track when browser sends endAudio
+        audio_input_ended = False 
+        response_count = 0  
 
         async def receive_loop() -> None:
             """Receive both audio (binary) and control messages (JSON) from browser."""
-            nonlocal audio_bytes_count, audio_input_started, audio_input_ended
+            nonlocal audio_bytes_count, audio_input_started, audio_input_ended, response_count
             try:
                 logger.info("🚀 Receive loop started — waiting for browser audio...")
                 while session.state.name != "CLOSED":
@@ -184,7 +185,18 @@ async def voice_websocket(websocket: WebSocket) -> None:
                                     logger.info("📨 Received control: %s", control_msg.get("type"))
                                     
                                     if control_msg.get("type") == "startAudio":
-                                        logger.info("  (handled via first binary frame)")
+                                        logger.info("  Resetting for new conversation...")
+                                        audio_input_ended = False
+                                        audio_bytes_count = 0
+                                        
+                                        if response_count > 0:
+                                            logger.info("  Starting new prompt cycle for request #%d", response_count + 1)
+                                            try:
+                                                await session.start_next_prompt()
+                                            except Exception as e:
+                                                logger.error("✗ Failed to start next prompt: %s", e, exc_info=True)
+                                        
+                                        logger.info("  (ready for first binary frame)")
 
                                     elif control_msg.get("type") == "endAudio":
                                         logger.info("")
@@ -199,9 +211,6 @@ async def voice_websocket(websocket: WebSocket) -> None:
                                 except json.JSONDecodeError as e:
                                     logger.warning("Failed to parse control: %s", e)
                     except asyncio.TimeoutError:
-                        if audio_input_ended:
-                            logger.info("  (No more messages after endAudio, closing receive loop)")
-                            break
                         pass
                     except Exception as e:
                         logger.error("✗ Receive error (state=%s): %s", session.state.name, e, exc_info=True)
@@ -212,8 +221,12 @@ async def voice_websocket(websocket: WebSocket) -> None:
 
         async def send_loop() -> None:
             """Send audio output and metadata events from Nova Sonic to browser."""
+            nonlocal response_count
             audio_sent = 0
             metadata_sent = 0
+            send_errors = 0
+            max_send_errors = 3
+            
             try:
                 logger.info("Send loop started - waiting for Nova Sonic output...")
                 while session.state.name != "CLOSED":
@@ -223,16 +236,26 @@ async def voice_websocket(websocket: WebSocket) -> None:
                             pcm_chunk = await asyncio.wait_for(
                                 session.audio_output_queue.get(), timeout=0.1
                             )
-                            await websocket.send_bytes(pcm_chunk)
-                            audio_sent += 1
-                            if audio_sent == 1:
-                                logger.info("")
-                                logger.info("="*80)
-                                logger.info("🔊 [AUDIO STREAMING TO BROWSER] Response audio flowing...")
-                                logger.info("="*80)
-                                logger.info("")
-                            if audio_sent % 10 == 0:
-                                logger.debug("  → Sent %d audio chunks to browser", audio_sent)
+                            try:
+                                await websocket.send_bytes(pcm_chunk)
+                                audio_sent += 1
+                                send_errors = 0  # Reset error counter on success
+                                if audio_sent == 1:
+                                    logger.info("")
+                                    logger.info("="*80)
+                                    logger.info("🔊 [AUDIO STREAMING TO BROWSER] Response audio flowing...")
+                                    logger.info("="*80)
+                                    logger.info("")
+                                if audio_sent % 10 == 0:
+                                    logger.debug("  → Sent %d audio chunks to browser", audio_sent)
+                            except (WebSocketDisconnect, RuntimeError) as send_err:
+                                send_errors += 1
+                                logger.warning("Audio send error #%d: %s", send_errors, send_err)
+                                if send_errors >= max_send_errors:
+                                    logger.error("Max audio send errors reached, exiting send_loop")
+                                    break
+                                # Don't break immediately — retry next iteration
+                                await asyncio.sleep(0.05)
                         except asyncio.TimeoutError:
                             pass
 
@@ -254,9 +277,31 @@ async def voice_websocket(websocket: WebSocket) -> None:
                                 logger.info("  ✓ → Browser: Tool returned data")
                             elif event_type == "response":
                                 logger.debug("  📝 → Browser: response: %s", metadata.get("text", "")[:50])
+                            elif event_type == "response_complete":
+                                logger.info("")
+                                logger.info("="*80)
+                                logger.info("✓ RESPONSE COMPLETE (#%d) — Ready for next question", response_count + 1)
+                                logger.info("="*80)
+                                logger.info("")
+                                response_count += 1
+                                try:
+                                    await websocket.send_json(metadata)
+                                    metadata_sent += 1
+                                except (WebSocketDisconnect, RuntimeError) as send_err:
+                                    logger.warning("Failed to send response_complete: %s", send_err)
+                                    break
+                                continue
                             
-                            await websocket.send_json(metadata)
-                            metadata_sent += 1
+                            try:
+                                await websocket.send_json(metadata)
+                                metadata_sent += 1
+                                send_errors = 0  # Reset on successful metadata send
+                            except (WebSocketDisconnect, RuntimeError) as send_err:
+                                send_errors += 1
+                                logger.warning("Metadata send error #%d: %s", send_errors, send_err)
+                                if send_errors >= max_send_errors:
+                                    logger.error("Max metadata send errors reached, exiting send_loop")
+                                    break
                         except asyncio.TimeoutError:
                             pass
 
@@ -265,7 +310,7 @@ async def voice_websocket(websocket: WebSocket) -> None:
                         break
                     except Exception as exc:
                         if session.state.name != "CLOSED":
-                            logger.error("Error in send_loop: %s", exc)
+                            logger.error("Unexpected error in send_loop: %s", exc, exc_info=True)
                         break
                 
                 logger.info("")

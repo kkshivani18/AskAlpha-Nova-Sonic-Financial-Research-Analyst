@@ -39,8 +39,9 @@ class NovaSonicSession:
         self._stream: Any = None
         self._prompt_id: str = str(uuid.uuid4())
         self._content_id: str = str(uuid.uuid4())
-        self.audio_output_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self.metadata_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        # Increase queue buffer to prevent audio data loss
+        self.audio_output_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+        self.metadata_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
         self._consumer_task: asyncio.Task | None = None
         self._tool_history: list[dict[str, Any]] = []
         self._current_block_role: str | None = None
@@ -191,6 +192,51 @@ class NovaSonicSession:
 
     # ── Audio input lifecycle ─────────────────────────────────────────────────
 
+    async def start_next_prompt(self) -> None:
+        """
+        Start a new prompt cycle without closing the session.
+        Called after a prompt completes (after response_complete event).
+        """
+        if self._state == SessionState.CLOSED:
+            logger.warning("Cannot start next prompt: session is closed")
+            return
+        
+        logger.info("")
+        logger.info("="*80)
+        logger.info("🔄 STARTING NEXT PROMPT — Preparing for next user request")
+        logger.info("="*80)
+        
+        try:
+            # Generate new prompt ID for this cycle
+            old_prompt_id = self._prompt_id
+            self._prompt_id = str(uuid.uuid4())
+            self._content_id = str(uuid.uuid4())
+            self._user_utterance_parts = []
+            self._audio_chunks_received = 0
+            self._pending_tool_use = None
+            self._current_block_role = None
+            
+            # Reset session context
+            self._session_context["prompt_id"] = self._prompt_id
+            
+            logger.info("  Old prompt_id: %s", old_prompt_id)
+            logger.info("  New prompt_id: %s", self._prompt_id)
+            
+            # Send new promptStart
+            await self._send_event(
+                self._client.build_audio_input_start_event(self._prompt_id, self._content_id)
+            )
+            logger.info("✓ New promptStart sent and ready for next audio input")
+            
+            self._state = SessionState.LISTENING
+            logger.info("✓ Session state returned to LISTENING")
+            logger.info("="*80)
+            logger.info("")
+        except Exception as e:
+            logger.error("✗ Failed to start next prompt: %s", e, exc_info=True)
+            self._state = SessionState.CLOSED
+            raise
+
     async def start_audio_input(self) -> None:
         self._user_utterance_parts = []  # ← RESET on new audio input
         audio_content_id = str(uuid.uuid4())
@@ -330,24 +376,45 @@ class NovaSonicSession:
                     logger.info("Consumer cancelled")
                     raise
                 except StopAsyncIteration:
-                    logger.info("Stream ended (StopAsyncIteration)")
-                    break
+                    logger.info("Stream ended (StopAsyncIteration) — waiting briefly before retrying...")
+                    await asyncio.sleep(0.1)
+                    continue  # Don't break — keep trying for next prompt
                 except Exception as e:
                     if self._state == SessionState.CLOSED:
-                        logger.info("Session already closed, consumer exiting")
+                        logger.info("Session explicitly closed, consumer exiting")
                         break
                     consecutive_errors += 1
+                    error_msg = str(e)
+                    
+                    # Log with detail for debugging
                     logger.error(
                         "Event read error #%d (consecutive_error=%d/%d): %s",
-                        event_count, consecutive_errors, 5, e, exc_info=True
+                        event_count, consecutive_errors, 10, error_msg
                     )
-                    # Give up after 5 consecutive errors
-                    if consecutive_errors >= 5:
-                        logger.error("Too many consecutive errors, closing session")
-                        self._state = SessionState.CLOSED
+                    
+                    # Certain errors are recoverable (transient AWS issues)
+                    # Only break on truly fatal errors
+                    if "Invalid input request" in error_msg or "AWS_ERROR" in error_msg:
+                        # These errors can happen when tools fail or input is malformed
+                        # Emit an error event to frontend but keep session alive for next prompt
+                        try:
+                            await self.metadata_queue.put({
+                                "type": "response_complete",  # Commit incomplete response
+                                "error": error_msg
+                            })
+                        except:
+                            pass
+                        consecutive_errors = 0  # Reset counter — model error doesn't mean consumer is broken
+                        await asyncio.sleep(0.2)
+                        continue
+                    
+                    # Reset counter after a longer sequence (10 instead of 5)
+                    # Only exit if absolutely cannot recover
+                    if consecutive_errors >= 10:
+                        logger.error("✗ Too many consecutive errors (#%d), consumer giving up", consecutive_errors)
                         break
                     # Brief backoff before retrying
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.1)
 
         except asyncio.CancelledError:
             logger.info("Consumer cancelled at top level")
@@ -355,11 +422,12 @@ class NovaSonicSession:
             logger.error("Consumer fatal error: %s", exc, exc_info=True)
         finally:
             logger.info("Consumer done after %d events", event_count)
-            if self._state != SessionState.CLOSED:
-                logger.info("Consumer exiting but session still active, allowing graceful close")
+            # Only close if explicitly requested, not after each prompt
+            # This allows multiple prompts in the same session
+            if self._state == SessionState.CLOSED:
+                logger.info("Session explicitly closed")
             else:
-                logger.info("Session already marked closed")
-            self._state = SessionState.CLOSED
+                logger.info("Prompt cycle complete, but session remains open for next prompt")
 
     async def _handle_output_event(self, event: dict[str, Any]) -> None:
 
@@ -374,7 +442,18 @@ class NovaSonicSession:
                 logger.info("="*80)
                 logger.info("")
             logger.info("  📻 [AUDIO] response chunk #%d: %d bytes", self._audio_chunks_received, len(pcm))
-            await self.audio_output_queue.put(pcm)
+            
+            # Put audio without blocking to prevent queue backups
+            try:
+                self.audio_output_queue.put_nowait(pcm)
+            except asyncio.QueueFull:
+                logger.warning("Audio queue full, dropping oldest chunk")
+                try:
+                    self.audio_output_queue.get_nowait()
+                    self.audio_output_queue.put_nowait(pcm)
+                except asyncio.QueueEmpty:
+                    logger.warning("Audio queue error, skipping chunk")
+            
             self._state = SessionState.SPEAKING
 
         elif "textOutput" in event:
