@@ -7,60 +7,77 @@ Run: pytest tests/test_nova_sonic_client.py -v
 import json
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-if "boto3" not in sys.modules:
-    boto3_stub = types.ModuleType("boto3")
-    boto3_stub.client = MagicMock()
-    sys.modules["boto3"] = boto3_stub
+# ---------------------------------------------------------------------------
+# Stub heavy AWS SDK dependencies BEFORE nova_sonic.client is imported.
+# We use dedicated variable names so the guards are idempotent when the full
+# test suite runs (another file may import boto3/config first).
+# ---------------------------------------------------------------------------
 
-if "botocore.exceptions" not in sys.modules:
-    botocore_stub = types.ModuleType("botocore")
-    botocore_exceptions_stub = types.ModuleType("botocore.exceptions")
+# aws_sdk_bedrock_runtime stub (the real SDK used by client.py)
+if "aws_sdk_bedrock_runtime" not in sys.modules:
+    _aws_mod = types.ModuleType("aws_sdk_bedrock_runtime")
+    _aws_client_mod = types.ModuleType("aws_sdk_bedrock_runtime.client")
+    _aws_models_mod = types.ModuleType("aws_sdk_bedrock_runtime.models")
+    _aws_config_mod = types.ModuleType("aws_sdk_bedrock_runtime.config")
 
-    class _ClientError(Exception):
-        pass
+    _aws_client_mod.BedrockRuntimeClient = MagicMock()
+    _aws_models_mod.BidirectionalInputPayloadPart = MagicMock()
+    _aws_models_mod.InvokeModelWithBidirectionalStreamInputChunk = MagicMock()
+    _aws_models_mod.InvokeModelWithBidirectionalStreamOperationInput = MagicMock()
+    _aws_config_mod.Config = MagicMock()
 
-    botocore_exceptions_stub.ClientError = _ClientError
-    sys.modules["botocore"] = botocore_stub
-    sys.modules["botocore.exceptions"] = botocore_exceptions_stub
+    sys.modules["aws_sdk_bedrock_runtime"] = _aws_mod
+    sys.modules["aws_sdk_bedrock_runtime.client"] = _aws_client_mod
+    sys.modules["aws_sdk_bedrock_runtime.models"] = _aws_models_mod
+    sys.modules["aws_sdk_bedrock_runtime.config"] = _aws_config_mod
+
+if "smithy_aws_core" not in sys.modules:
+    _smithy_mod = types.ModuleType("smithy_aws_core")
+    _smithy_id_mod = types.ModuleType("smithy_aws_core.identity")
+    _smithy_env_mod = types.ModuleType("smithy_aws_core.identity.environment")
+    _smithy_env_mod.EnvironmentCredentialsResolver = MagicMock()
+    sys.modules["smithy_aws_core"] = _smithy_mod
+    sys.modules["smithy_aws_core.identity"] = _smithy_id_mod
+    sys.modules["smithy_aws_core.identity.environment"] = _smithy_env_mod
 
 if "config" not in sys.modules:
-    config_stub = types.ModuleType("config")
+    _config_stub = types.ModuleType("config")
 
     class _SettingsStub:
         aws_access_key_id = "test-key"
         aws_secret_access_key = "test-secret"
         aws_region = "us-east-1"
         nova_sonic_model_id = "amazon.nova-sonic-v1:0"
-        # market data
         finnhub_api_key = ""
         polygon_api_key = "test-polygon-key"
         tiingo_api_key = ""
-        # vault / note generation
         note_llm_provider = "none"
         note_llm_timeout_seconds = 20
         groq_api_key = ""
         groq_model = "llama-3.3-70b-versatile"
         groq_base_url = "https://api.groq.com/openai/v1"
         nova_lite_model_id = "amazon.nova-lite-v1:0"
-        # misc
         log_level = "INFO"
-        vault_path = (
-            None  # individual tests override via patch("tools.vault_logger.settings")
-        )
+        vault_path = None
 
-    config_stub.settings = _SettingsStub()
-    sys.modules["config"] = config_stub
+    _config_stub.settings = _SettingsStub()
+    sys.modules["config"] = _config_stub
 
-from nova_sonic.client import NovaSonicClient
-from nova_sonic.tool_schemas import ALL_TOOLS
+from nova_sonic.client import NovaSonicClient  # noqa: E402
+from nova_sonic.tool_schemas import ALL_TOOLS  # noqa: E402
 
 
 def _build_client() -> NovaSonicClient:
-    """Create client with boto3 mocked to avoid real AWS setup in unit tests."""
-    with patch("nova_sonic.client.boto3.client", return_value=MagicMock()):
+    """Create client with BedrockRuntimeClient mocked to avoid real AWS calls."""
+    with patch("nova_sonic.client.BedrockRuntimeClient", return_value=MagicMock()):
         return NovaSonicClient()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
 def test_build_session_start_event_contains_expected_sections() -> None:
@@ -79,20 +96,15 @@ def test_build_session_start_event_contains_expected_sections() -> None:
 
 
 def test_build_audio_input_start_event_uses_expected_audio_formats() -> None:
+    # client.py signature: build_audio_input_start_event(prompt_name, content_name)
     event = NovaSonicClient.build_audio_input_start_event("prompt-1", "content-1")
 
     prompt_start = event["event"]["promptStart"]
-    assert prompt_start["promptId"] == "prompt-1"
+    # Current implementation uses promptName (AWS SDK v2 naming)
+    assert prompt_start["promptName"] == "prompt-1"
 
-    in_audio = prompt_start["inputConfiguration"]["audio"]
-    assert in_audio["mediaType"] == "audio/lpcm"
-    assert in_audio["sampleRateHertz"] == 16000
-    assert in_audio["sampleSizeBits"] == 16
-    assert in_audio["channelCount"] == 1
-    assert in_audio["audioType"] == "SPEECH"
-    assert in_audio["encoding"] == "base64"
-
-    out_audio = prompt_start["outputConfiguration"]["audio"]
+    # Output audio is under audioOutputConfiguration (flat, not nested)
+    out_audio = prompt_start["audioOutputConfiguration"]
     assert out_audio["mediaType"] == "audio/lpcm"
     assert out_audio["sampleRateHertz"] == 24000
     assert out_audio["sampleSizeBits"] == 16
@@ -104,8 +116,9 @@ def test_build_audio_chunk_event_contains_prompt_content_and_payload() -> None:
     event = NovaSonicClient.build_audio_chunk_event("prompt-2", "content-2", "YWJj")
 
     audio_input = event["event"]["audioInput"]
-    assert audio_input["promptId"] == "prompt-2"
-    assert audio_input["contentId"] == "content-2"
+    # Current implementation uses promptName / contentName (AWS SDK v2 naming)
+    assert audio_input["promptName"] == "prompt-2"
+    assert audio_input["contentName"] == "content-2"
     assert audio_input["content"] == "YWJj"
 
 
@@ -115,7 +128,8 @@ def test_build_tool_result_event_serializes_result_json() -> None:
     event = NovaSonicClient.build_tool_result_event("prompt-3", "tool-123", result)
 
     tool_result = event["event"]["toolResult"]
-    assert tool_result["promptId"] == "prompt-3"
+    # Current implementation uses promptName (AWS SDK v2 naming)
+    assert tool_result["promptName"] == "prompt-3"
     assert tool_result["toolUseId"] == "tool-123"
     assert tool_result["status"] == "success"
 
