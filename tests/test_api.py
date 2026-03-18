@@ -10,6 +10,10 @@ This demonstrates the three key models in your Voice AI Agent:
 import boto3
 import json
 import os
+import pytest
+
+# Mark this module: run only with  pytest -m integration
+pytestmark = pytest.mark.integration
 
 # Set credentials (better to use .env file in production)
 os.environ["AWS_BEARER_TOKEN_BEDROCK"] = ""
