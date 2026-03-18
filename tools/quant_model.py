@@ -97,15 +97,24 @@ async def _fetch_polygon_closes(ticker: str, from_iso: str, today: str) -> list[
     return []
 
 
+_VOL_CACHE: dict[str, dict[str, Any]] = {}
+_CACHE_TTL_SECONDS = 60
+
 async def _get_price_and_volatility(ticker: str) -> tuple[float, float]:
     """
     Returns (current_price, annualised_volatility).
+
 
     Finnhub quote and Tiingo/Polygon bar fetches are fired in parallel with
     asyncio.gather() so latency is dominated by the slowest single call
     rather than the sum of all calls.
     """
     import datetime
+
+    cached_entry = _VOL_CACHE.get(ticker)
+    if cached_entry and time.time() - cached_entry["timestamp"] < _CACHE_TTL_SECONDS:
+        logger.info("Volatility cache hit for ticker=%s", ticker)
+        return cached_entry["payload"]
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     from_iso = (now_utc - datetime.timedelta(days=120)).date().isoformat()
@@ -137,6 +146,10 @@ async def _get_price_and_volatility(ticker: str) -> tuple[float, float]:
                 "Tiingo" if cleaned_closes is tiingo_closes else "Polygon",
                 annual_vol,
             )
+            _VOL_CACHE[ticker] = {
+                "timestamp": time.time(),
+                "payload": (current_price, annual_vol),
+            }
             return current_price, annual_vol
         except Exception as exc:
             logger.warning("Vol computation failed: %s — defaulting to 0.30", exc)
@@ -147,7 +160,12 @@ async def _get_price_and_volatility(ticker: str) -> tuple[float, float]:
             len(polygon_closes),
         )
 
-    return current_price, 0.30  # sensible default
+    result = (current_price, 0.30)  # sensible default
+    _VOL_CACHE[ticker] = {
+        "timestamp": time.time(),
+        "payload": result,
+    }
+    return result
 
 
 # ── Native Python execution ───────────────────────────────────────────────────
