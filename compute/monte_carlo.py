@@ -106,18 +106,17 @@ def _simulate_pure_python(
     simulations: int,
     drift: float,
 ) -> dict[str, float]:
-    """Fallback GBM implementation that requires only the stdlib."""
-    dt = 1.0 / 252.0
-    half_vol_sq_dt = 0.5 * volatility**2 * dt
-    vol_sqrt_dt = volatility * math.sqrt(dt)
-    drift_dt = drift * dt
+    """Fallback GBM implementation. Jumps straight to final day for performance."""
+    total_dt = days / 252.0
+    half_vol_sq_dt = 0.5 * volatility**2 * total_dt
+    vol_sqrt_dt = volatility * math.sqrt(total_dt)
+    drift_dt = drift * total_dt
 
     finals: list[float] = []
+    # Avoid path-by-path daily loops! Jump straight to final projection.
     for _ in range(simulations):
-        price = current_price
-        for _ in range(days):
-            z = random.gauss(0.0, 1.0)
-            price *= math.exp(drift_dt - half_vol_sq_dt + vol_sqrt_dt * z)
+        z = random.gauss(0.0, 1.0)
+        price = current_price * math.exp(drift_dt - half_vol_sq_dt + vol_sqrt_dt * z)
         finals.append(price)
 
     finals.sort()
